@@ -104,8 +104,13 @@ class SalesController extends Controller
             ->orderByDesc('id')
             ->get([
                 'id', 'invoice_no', 'document_no', 'transaction_date', 'declared_month', 'grand_total',
-                'customer_id', 'invoice_status_id', 'audit_status_id', 'invalid_reason',
+                'customer_id', 'invoice_status_id', 'audit_status_id', 'invalid_reason', 'account_code',
             ]);
+
+        // Accounts column: "11201 - Accounts Receivable"
+        $acctNames = ChartsOfAccount::where('added_by', $addedBy)
+            ->whereIn('account_code', $list->pluck('account_code')->filter()->unique()->values())
+            ->pluck('account_name', 'account_code');
 
         $reasons = DB::table('t_invalid_reason')->whereIn('reference_no', $list->pluck('invoice_no'))
             ->orderBy('id')->pluck('reason', 'reference_no');
@@ -127,6 +132,7 @@ class SalesController extends Controller
             'document_no'      => $r->document_no,
             'transaction_date' => $r->transaction_date?->format('Y-m-d'),
             'declared_month'   => $this->monthLabel($r->declared_month),
+            'account'          => $r->account_code ? rtrim($r->account_code . ' - ' . ($acctNames[$r->account_code] ?? ''), ' -') : '',
             'total'            => $r->grand_total,
             'status'           => $r->invoiceStatus->name ?? '',
             'audit_status'     => $r->auditStatus->name ?? '',

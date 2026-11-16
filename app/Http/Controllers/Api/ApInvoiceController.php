@@ -271,8 +271,13 @@ abstract class ApInvoiceController extends SalesController
         if ($type === 'posted') $q->where(fn ($w) => $w->where('record_status', 'posted')->orWhereNull('record_status'));
         elseif ($type) $q->where('record_status', $type);
  
-        $cols = ['id', 'invoice_no', 'document_no', 'transaction_date', 'declared_month', 'grand_total', 'vendor_id', 'invoice_status_id', 'audit_status_id'];
+        $cols = ['id', 'invoice_no', 'document_no', 'transaction_date', 'declared_month', 'grand_total', 'vendor_id', 'invoice_status_id', 'audit_status_id', 'account_code'];
         $list = $q->orderByDesc('id')->get($cols);
+
+        // Accounts column: "20101 - Accounts Payable"
+        $acctNames = ChartsOfAccount::where('added_by', $addedBy)
+            ->whereIn('account_code', $list->pluck('account_code')->filter()->unique()->values())
+            ->pluck('account_name', 'account_code');
  
         // invalid reason from t_invalid_reason (latest per invoice)
         $reasons = DB::table('t_invalid_reason')->whereIn('reference_no', $list->pluck('invoice_no'))
@@ -291,6 +296,7 @@ abstract class ApInvoiceController extends SalesController
             'document_no'      => $r->document_no,
             'transaction_date' => $r->transaction_date ? substr((string) $r->transaction_date, 0, 10) : null,
             'declared_month'   => $this->apMonthLabel($r->declared_month),
+            'account'          => $r->account_code ? rtrim($r->account_code . ' - ' . ($acctNames[$r->account_code] ?? ''), ' -') : '',
             'total'            => (float) $r->grand_total,
             'status'           => $statuses[$r->invoice_status_id] ?? '',
             'audit_status'     => $audits[$r->audit_status_id] ?? '',

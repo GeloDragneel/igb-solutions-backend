@@ -9,6 +9,7 @@ use App\Models\VendorCustomer;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Filesystem\FilesystemAdapter;
@@ -41,6 +42,139 @@ class PurchaseOrderController extends PurchaseController
     private function poOpenStatus(): int
     {
         return (int) (DB::table('m_pos_status')->whereRaw("UPPER(name) LIKE 'OPEN%'")->value('id') ?: 1);
+    }
+
+    /* ---------- received so far on a PO (Receive Inventory: t_grn_detail, not VOID) ---------- */
+    private function poReceipt(object $po): array
+    {
+        $ordered = (float) DB::table(self::PD)->where('po_number', $po->po_number)->sum('qty');
+        $received = 0.0;
+        if (Schema::hasTable('t_grn_detail')) {
+            $cols = Schema::getColumnListing('t_grn_detail');
+            $qty  = in_array('qty', $cols, true) ? 'qty' : (in_array('quantity', $cols, true) ? 'quantity' : null);
+            $q = DB::table('t_grn_detail');
+            if (in_array('po_number', $cols, true)) $q->where('po_number', $po->po_number);
+            elseif (in_array('po_id', $cols, true)) $q->whereIn('po_id', DB::table(self::PD)->where('po_number', $po->po_number)->pluck('id')->push($po->id));
+            else $q = null;
+            if ($q && $qty) {
+                if (in_array('grn_status_id', $cols, true)) $q->where(fn ($w) => $w->whereNull('grn_status_id')->orWhere('grn_status_id', '<>', 5));
+                $received = (float) $q->sum($qty);
+            }
+        }
+        return ['ordered' => round($ordered, 4), 'received' => round($received, 4), 'left' => round(max(0, $ordered - $received), 4)];
+    }
+
+    /** received qty per item on this PO: [item_id => qty] (Receive Inventory, not VOID) */
+    private function poReceivedByItem(object $po): array
+    {
+        if (!Schema::hasTable('t_grn_detail')) return [];
+        $cols = Schema::getColumnListing('t_grn_detail');
+        $qty  = in_array('qty', $cols, true) ? 'qty' : (in_array('quantity', $cols, true) ? 'quantity' : null);
+        if (!$qty || !in_array('item_id', $cols, true)) return [];
+        $q = DB::table('t_grn_detail');
+        if (in_array('po_number', $cols, true)) $q->where('po_number', $po->po_number);
+        elseif (in_array('po_id', $cols, true)) $q->whereIn('po_id', DB::table(self::PD)->where('po_number', $po->po_number)->pluck('id')->push($po->id));
+        else return [];
+        if (in_array('grn_status_id', $cols, true)) $q->where(fn ($w) => $w->whereNull('grn_status_id')->orWhere('grn_status_id', '<>', 5));
+        return $q->groupBy('item_id')->selectRaw("item_id, SUM({$qty}) AS n")->pluck('n', 'item_id')->map(fn ($v) => (float) $v)->all();
+    }
+
+    /** who is doing it (staff / client login) */
+    private function actorName(Request $request): string
+    {
+        $u = $request->user();
+        foreach (['name', 'full_name', 'username', 'user_name', 'email'] as $c) {
+            if (!empty($u->{$c})) return (string) $u->{$c};
+        }
+        return (string) ($u->id ?? '');
+    }
+
+    /* GET /api/purchase-orders/{poNumber}/logs   force-close log: PO qty vs received qty per item */
+    public function poLogs(Request $request, string $poNumber)
+    {
+        $po = $this->poFind($this->addedByFor($request), 'po_number', $poNumber);
+        if (!$po) return response()->json(['message' => 'Purchase order not found.'], 404);
+        if (!Schema::hasTable('t_porder_close_log')) return response()->json(['rows' => []]);
+
+        $rows = DB::table('t_porder_close_log')->where('po_number', $po->po_number)->orderByDesc('id')->get()
+            ->map(fn ($r) => [
+                'id'          => $r->id,
+                'date'        => (string) $r->created_at,
+                'item'        => trim(($r->item_code ? $r->item_code . ' – ' : '') . ($r->item_description ?? '')) ?: '—',
+                'ordered'     => (float) $r->ordered_qty,
+                'received'    => (float) $r->received_qty,
+                'closed'      => (float) $r->closed_qty,
+                'closed_by'   => $r->closed_by_name,
+                'old_status'  => $this->poStatusName($r->old_status_id),
+                'new_status'  => $this->poStatusName($r->new_status_id),
+            ]);
+        return response()->json(['rows' => $rows]);
+    }
+
+    /** the existing "Closed" status of m_pos_status (id 3) */
+    private function poClosedStatus(): int
+    {
+        return (int) (DB::table('m_pos_status')->whereRaw("UPPER(TRIM(name)) = 'CLOSED'")->value('id') ?: 3);
+    }
+
+    /* POST /api/purchase-orders/{id}/force-close
+       partly received PO → Closed (m_pos_status id 3): what is left can't be received any more (the received part stays) */
+    public function poForceClose(Request $request, int $id)
+    {
+        $po = $this->poFind($this->addedByFor($request), 'id', $id);
+        if (!$po) return response()->json(['message' => 'Purchase order not found.'], 404);
+        if ((int) $po->po_status_id === 5) return response()->json(['message' => 'This purchase order is void.'], 422);
+        $closedId = $this->poClosedStatus();
+        if ((int) $po->po_status_id === $closedId) return response()->json(['message' => 'This purchase order is already closed.'], 422);
+        if (RequestTicket::where('reference_no', $po->po_number)->where('is_status', 0)->exists()) {
+            return response()->json(['message' => 'A ticket is pending for this purchase order.'], 422);
+        }
+
+        // partly received: the PO status says PARTIAL (set by Receive Inventory), or the received qty is between 0 and the ordered qty
+        $r = $this->poReceipt($po);
+        $partial = stripos($this->poStatusName($po->po_status_id), 'PARTIAL') !== false
+            || ($r['received'] > 0 && $r['left'] > 0);
+        if (!$partial) {
+            return response()->json(['message' => $r['received'] <= 0
+                ? 'Nothing has been received on this PO yet. Void it instead.'
+                : 'This PO is fully received already.'], 422);
+        }
+
+        DB::transaction(function () use ($po, $closedId, $request) {
+            // log: every PO line with its PO qty, received qty and the qty that is closed
+            if (Schema::hasTable('t_porder_close_log')) {
+                $got = $this->poReceivedByItem($po);
+                $lines = DB::table(self::PD . ' as L')->leftJoin('m_items as I', 'I.id', '=', 'L.item_id')
+                    ->where('L.po_number', $po->po_number)->orderBy('L.id')
+                    ->get(['L.id', 'L.item_id', 'L.qty', 'I.item_code', 'I.description']);
+                $left = $got;                                    // received qty is used up line by line (same item on 2 lines)
+                $now = now();
+                $by = $this->actorName($request);
+                foreach ($lines as $l) {
+                    $ordered = (float) $l->qty;
+                    $rec = min($ordered, (float) ($left[$l->item_id] ?? 0));
+                    if (isset($left[$l->item_id])) $left[$l->item_id] -= $rec;
+                    DB::table('t_porder_close_log')->insert([
+                        'po_master_id' => $po->id, 'po_number' => $po->po_number, 'po_detail_id' => $l->id,
+                        'item_id' => $l->item_id, 'item_code' => $l->item_code, 'item_description' => $l->description,
+                        'ordered_qty' => $ordered, 'received_qty' => $rec, 'closed_qty' => max(0, $ordered - $rec),
+                        'old_status_id' => $po->po_status_id, 'new_status_id' => $closedId,
+                        'closed_by' => $request->user()->id ?? null, 'closed_by_name' => mb_substr($by, 0, 150),
+                        'added_by' => $po->added_by, 'created_at' => $now, 'updated_at' => $now,
+                    ]);
+                }
+            }
+
+            DB::table(self::PM)->where('id', $po->id)->update($this->apOnly(self::PM, ['po_status_id' => $closedId, 'updated_at' => now()]));
+            DB::table(self::PD)->where('po_number', $po->po_number)->update($this->apOnly(self::PD, ['po_status_id' => $closedId, 'updated_at' => now()]));
+        });
+
+        return response()->json([
+            'message' => $r['received'] > 0
+                ? "{$po->po_number} closed · {$r['received']} of {$r['ordered']} received, {$r['left']} will not be received"
+                : "{$po->po_number} closed",
+            'status'  => 'Closed',
+        ]);
     }
 
     /* GET /api/purchase-orders?from=2026-01&to=2026-09   (old qry2_purchase_master.php) */
@@ -110,6 +244,7 @@ class PurchaseOrderController extends PurchaseController
             'customer' => $po->vendor_id ? VendorCustomer::find($po->vendor_id, $this->apVendorCols()) : null,
             'ticket'   => $ticket,
             'scan'     => null,
+            'receipt'  => $this->poReceipt($po),            // { ordered, received, left } → Force Close button
         ]);
     }
 

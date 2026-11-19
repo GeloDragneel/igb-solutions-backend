@@ -47,6 +47,8 @@ use App\Http\Controllers\Api\SendRequestController;
 use App\Http\Controllers\Api\ClientLetterController;
 use App\Http\Controllers\Api\PosController;
 use App\Http\Controllers\Api\EmployeePerformanceController;
+use App\Http\Controllers\Api\SalesOrderController;
+use App\Http\Controllers\Api\ClientTicketController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -260,7 +262,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/purchase-orders/{id}/attachment', [PurchaseOrderController::class, 'poAttachment'])->whereNumber('id');
     Route::post('/purchase-orders/{id}/attachment', [PurchaseOrderController::class, 'poUploadAttachment'])->whereNumber('id');
     Route::post('/purchase-orders/{id}/ticket', [PurchaseOrderController::class, 'poTicket'])->whereNumber('id');
-
+    Route::post('/purchase-orders/{id}/force-close', [PurchaseOrderController::class, 'poForceClose'])->whereNumber('id');
+    Route::get('/purchase-orders/{poNumber}/logs', [PurchaseOrderController::class, 'poLogs']);
+    
     Route::get('/importation', [ImportationController::class, 'trIndex']);
     Route::post('/importation', [ImportationController::class, 'trStore']);
     Route::get('/importation/lookups', [ImportationController::class, 'trLookups']);
@@ -850,6 +854,20 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/monitoring/performance/lookups', [EmployeePerformanceController::class, 'lookups']);
     Route::get('/monitoring/performance', [EmployeePerformanceController::class, 'index']);
     Route::get('/monitoring/performance/{id}', [EmployeePerformanceController::class, 'show'])->whereNumber('id');
+
+    Route::get('/sales-orders', [SalesOrderController::class, 'index']);
+    Route::get('/sales-orders/order/{soNumber}', [SalesOrderController::class, 'showOrder']);
+    Route::post('/sales-orders', [SalesOrderController::class, 'storeOrder']);
+    Route::put('/sales-orders/{id}', [SalesOrderController::class, 'updateOrder'])->whereNumber('id');
+    Route::post('/sales-orders/{id}/void', [SalesOrderController::class, 'voidOrder'])->whereNumber('id');
+    Route::post('/sales-orders/{id}/create-invoice', [SalesOrderController::class, 'createInvoice'])->whereNumber('id');
+
+    // Admin → Ticket (FEMS): current client's tickets only
+    Route::get('/client-tickets', [ClientTicketController::class, 'ticketList']);
+    Route::get('/client-tickets/{ticketNo}', [ClientTicketController::class, 'ticketShow']);
+    Route::get('/client-tickets/{ticketNo}/attachment', [ClientTicketController::class, 'ticketAttachment']);
+    Route::post('/client-tickets/{ticketNo}/approve', [ClientTicketController::class, 'ticketApprove']);
+    Route::post('/client-tickets/{ticketNo}/decline', [ClientTicketController::class, 'ticketDecline']);
 
     require __DIR__ . '/api_messenger.php';
 });

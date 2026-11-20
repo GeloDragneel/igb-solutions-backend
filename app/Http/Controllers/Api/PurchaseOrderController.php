@@ -79,6 +79,58 @@ class PurchaseOrderController extends PurchaseController
         return $q->groupBy('item_id')->selectRaw("item_id, SUM({$qty}) AS n")->pluck('n', 'item_id')->map(fn ($v) => (float) $v)->all();
     }
 
+    /* ---------- Shipping Terms · Payment Terms · Ship To · Delivery Method (one list per client) ---------- */
+    private const PO_TERMS = [
+        'shipping_terms'   => ['table' => 'm_shipping_terms',   'col' => 'shipping_term_id',   'label' => 'Shipping Terms'],
+        'payment_terms'    => ['table' => 'm_payment_terms',    'col' => 'payment_term_id',    'label' => 'Payment Terms'],
+        'ship_to'          => ['table' => 'm_ship_to',          'col' => 'ship_to_id',         'label' => 'Ship To'],
+        'delivery_methods' => ['table' => 'm_delivery_methods', 'col' => 'delivery_method_id', 'label' => 'Delivery Method'],
+    ];
+
+    /** the 4 picked values from the request (validated here: apRules() doesn't know them) */
+    private function poTermIds(array $in, int $addedBy): array
+    {
+        $out = [];
+        foreach (self::PO_TERMS as $t) {
+            $id = (int) ($in[$t['col']] ?? 0);
+            // only an id of this client's own list
+            $out[$t['col']] = $id > 0 && Schema::hasTable($t['table'])
+                && DB::table($t['table'])->where('id', $id)->where('client_id', $addedBy)->exists() ? $id : null;
+        }
+        return $out;
+    }
+
+    /* GET /api/purchase-orders/terms   the 4 lists of this client */
+    public function poTerms(Request $request)
+    {
+        $addedBy = $this->addedByFor($request);
+        $out = [];
+        foreach (self::PO_TERMS as $kind => $t) {
+            $out[$kind] = $addedBy && Schema::hasTable($t['table'])
+                ? DB::table($t['table'])->where('client_id', $addedBy)->orderBy('name')->get(['id', 'name'])
+                : [];
+        }
+        return response()->json($out);
+    }
+
+    /* POST /api/purchase-orders/terms/{kind}   { name }   + Add New (same name again → the existing one) */
+    public function poTermAdd(Request $request, string $kind)
+    {
+        abort_unless(isset(self::PO_TERMS[$kind]), 404, 'Unknown list.');
+        $t = self::PO_TERMS[$kind];
+        $d = $request->validate(['name' => ['required', 'string', 'max:150']], ['name.required' => "{$t['label']} is required."]);
+        $addedBy = $this->addedByFor($request);
+        if (!$addedBy) return response()->json(['message' => 'No client account selected.'], 422);
+
+        $name = trim($d['name']);
+        $row = DB::table($t['table'])->where('client_id', $addedBy)->where('name', $name)->first(['id', 'name']);
+        if (!$row) {
+            $id = DB::table($t['table'])->insertGetId(['client_id' => $addedBy, 'name' => $name, 'created_at' => now(), 'updated_at' => now()]);
+            $row = (object) ['id' => $id, 'name' => $name];
+        }
+        return response()->json(['id' => (int) $row->id, 'name' => $row->name]);
+    }
+
     /** who is doing it (staff / client login) */
     private function actorName(Request $request): string
     {
@@ -327,7 +379,7 @@ class PurchaseOrderController extends PurchaseController
         $vt = ($d['atc_vt_id'] ?? null) ? ($d['vt_month'] ?? null) : null;
         $it = ($d['atc_it_id'] ?? null) ? ($d['it_month'] ?? null) : null;
 
-        return DB::transaction(function () use ($d, $addedBy, $lineRows, $statusId, $vt, $it) {
+        return DB::transaction(function () use ($d, $addedBy, $lineRows, $statusId, $vt, $it, $request) {
             do {
                 $poNumber = 'PO-' . date('ymd-his') . random_int(10000, 99999);
             } while (DB::table(self::PM)->where('po_number', $poNumber)->exists());
@@ -345,7 +397,7 @@ class PurchaseOrderController extends PurchaseController
                 'account_code' => $d['account_code'] ?? null,
                 '2307_vt_declared_month' => $vt, '2307_it_declared_month' => $it,
                 'created_at' => now(), 'updated_at' => now(),
-            ];
+            ] + $this->poTermIds($request->all(), $addedBy);
             $id = DB::table(self::PM)->insertGetId($this->apOnly(self::PM, $master));
 
             foreach ($lineRows as $l) {
@@ -406,7 +458,7 @@ class PurchaseOrderController extends PurchaseController
             'discount_type_id' => $d['discount_type_id'] ?? null, 'discount_amount' => $this->r4($d['discount_amount'] ?? 0),
             'declared_month' => $d['declared_month'], 'attachment' => $attachment,
             '2307_vt_declared_month' => $vt, '2307_it_declared_month' => $it, 'added_by' => $addedBy, 'trans_type' => 'Purchases',
-        ];
+        ] + $this->poTermIds($payload, $addedBy);
         $dataDetail = array_map(fn ($l) => [
             'po_master_id' => $po->id, 'po_number' => $po->po_number, 'item_id' => $l['item_id'],
             'qty' => $l['quantity'], 'quantity' => $l['quantity'], 'price' => $l['unit_price'], 'unit_price' => $l['unit_price'],

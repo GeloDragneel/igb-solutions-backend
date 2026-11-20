@@ -1013,11 +1013,7 @@ class ReportController extends SalesController
                 if ((float) $l->sub_total > 0) $add($b, $l->account_code, $acct($l->added_by, $l->account_code), 0, (float) $l->sub_total);
             }
         }
-
-        /* PURCHASE ORDER (t_porder_master / t_porder_detail): not posted to the ledger.
-           A PO is only an order – the books get the entry from Receive Inventory (GRN) / AP invoice.
-           So no PO lines in the General Ledger, Trial Balance, Balance Sheet or any report built on ledgerEntries(). */
-
+      
         /* ================= AP INVOICE (purchases + expenses) ================= */
         if ($want('AP')) {
             $apMasters = PurchaseExpenseMaster::whereIn('added_by', $ids)->active()->where('record_status', 'posted')

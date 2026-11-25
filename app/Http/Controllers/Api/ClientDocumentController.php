@@ -15,7 +15,8 @@ use Illuminate\Support\Str;
  * scanned documents of the client, kept in S3 under  ID_Solutions/{client #}/{type}/…
  *
  *   GET    /settings/documents                 documents + the extra profile fields
- *   POST   /settings/documents/scan            { doc_type, file_name, mime, data (base64) } → fields read from the document (nothing saved)
+ *   POST   /settings/documents/scan            { doc_type, file } → fields read from the document (nothing saved)
+ *   POST   /settings/documents/fields          { doc_type, text } → fields from text the browser read off a scan
  *   POST   /settings/documents                 { doc_type, valid_id_id? (doc_type valid_id), label?, doc_no?, name_on_doc?, date_registered?, issued_at?, expires_at?, extracted?, file_name, mime, data }
  *   PUT    /settings/documents/{id}            { label?, doc_no?, name_on_doc?, date_registered?, issued_at?, expires_at? }
  *   DELETE /settings/documents/{id}
@@ -125,10 +126,12 @@ class ClientDocumentController extends SalesController
         $d = $request->validate($this->fileRules());
         [$bytes, $mime] = $this->bytes($d, $request);
         $read = $reader->text($bytes, $mime, $d['file_name'] ?? 'file');
-        $fields = $read['text'] !== '' ? $reader->fields($d['doc_type'], $read['text']) : [];
+        $detected = $read['text'] !== '' ? $reader->detect($read['text']) : null;     // what the file really is
+        $fields = $read['text'] !== '' ? $reader->fields($reader->rulesFor($detected, $d['doc_type']), $read['text']) : [];
         $found = count(array_filter($fields, fn ($v) => $v !== null && $v !== []));
         return response()->json([
             'how' => $read['how'],
+            'detected' => $detected,
             'found' => $found,
             'fields' => $fields,
             'message' => $read['how'] === 'none'
@@ -136,6 +139,23 @@ class ClientDocumentController extends SalesController
                     ? "Couldn't read this file. Fill in the details yourself."
                     : 'This file is a scan. Reading scans is not turned on on the server yet (Tesseract) – fill in the details yourself.')
                 : ($found ? "Read {$found} detail(s) from the document. Check them before saving." : 'No details found in the document. Fill them in yourself.'),
+        ]);
+    }
+
+    /* POST /settings/documents/fields   { doc_type, text } — text read from a scan in the browser (Tesseract.js) → the same fields */
+    public function fieldsFromText(Request $request, DocumentReader $reader)
+    {
+        $this->clientNum($request);
+        $d = $request->validate([
+            'doc_type' => ['required', 'in:' . implode(',', array_keys(self::TYPES))],
+            'text' => ['required', 'string', 'max:200000'],
+        ]);
+        $detected = $reader->detect($d['text']);
+        $fields = $reader->fields($reader->rulesFor($detected, $d['doc_type']), $d['text']);
+        $found = count(array_filter($fields, fn ($v) => $v !== null && $v !== []));
+        return response()->json([
+            'how' => 'browser-ocr', 'detected' => $detected, 'found' => $found, 'fields' => $fields,
+            'message' => $found ? "Read {$found} detail(s) from the scan. Check them before saving." : 'No details found in the scan. Fill them in yourself.',
         ]);
     }
 

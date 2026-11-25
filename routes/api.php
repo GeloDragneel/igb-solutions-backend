@@ -877,7 +877,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('/settings/documents/{id}', [ClientDocumentController::class, 'destroy'])->whereNumber('id');
     Route::get('/settings/documents/{id}/file', [ClientDocumentController::class, 'file'])->whereNumber('id');
     Route::put('/settings/profile-extra', [ClientDocumentController::class, 'profileExtra']);
-
+    Route::post('/settings/documents/fields', [ClientDocumentController::class, 'fieldsFromText']);
+    
     require __DIR__ . '/api_messenger.php';
 });
 

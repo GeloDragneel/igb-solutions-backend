@@ -12,7 +12,7 @@ class DocumentReader
 {
     private const MONTHS = 'January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec';
     // "June 1, 2024" · "1 June 2024" · "06/01/2024" · "2024-06-01"
-    private const DATE = '(?:(?:' . self::MONTHS . ')\\.?\\s+\\d{1,2},?\\s+\\d{4}|\\d{1,2}\\s+(?:' . self::MONTHS . ')\\.?,?\\s+\\d{4}|\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{4}|\\d{4}-\\d{2}-\\d{2})';
+    private const DATE = '(?:(?:' . self::MONTHS . ')\\.?\\s+\\d{1,2},?\\s*\\d{4}|\\d{1,2}[\\s-]+(?:' . self::MONTHS . ')\\.?[\\s,-]+\\d{4}|\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{4}|\\d{4}-\\d{2}-\\d{2})';
 
     /** @return array{text:string, how:string} */
     public function text(string $bytes, string $mime, string $name): array
@@ -83,6 +83,53 @@ class DocumentReader
         }
     }
 
+    /** what the document is, from its text → one of the Document Types ("BIR" = TIN ID) · null when unsure
+        the title area (top of page 1) decides first, then the whole text */
+    public function detect(string $text): ?string
+    {
+        $all = strtoupper(preg_replace('/\s+/', ' ', $text));
+        $rules = [   // most specific first (SEC / BIR words appear on many papers)
+            'GIS FORM' => '/GENERAL INFORMATION SHEET/',
+            'SEC CERTIFICATE' => '/CERTIFICATE\s+OF\s+INCORPORATION|(?=.*SECURITIES\s+AND\s+EXCHANGE)(?=.*CERTIFICATE\s+OF\s+(?:REGISTRATION|RECORDING))/',
+            'ARTICLES OF COOPERATIONS' => '/ARTICLES\s+OF\s+COOPERATION/',
+            'ARTICLES OF INCORPORATIONS' => '/ARTICLES\s+OF\s+INCORPORATION/',
+            'BY-LAWS' => '/\bBY[\s-]?LAWS\b/',
+            'AUTHORIZE TO PRINT (ATP)' => '/AUTHORITY\s+TO\s+PRINT|AUTHORIZE\s+TO\s+PRINT|\bATP\s+NO/',
+            'TAX CLEARANCE' => '/TAX\s+CLEARANCE/',
+            'CERT. OF TAX EXCEPTION' => '/TAX\s+EXEMPTION|TAX\s+EXCEPTION/',
+            'PHILGEPS' => '/PHILGEPS|ELECTRONIC\s+PROCUREMENT/',
+            'PCAB' => '/\bPCAB\b|CONTRACTORS?[\'’]?\s*(?:LICENSE|ACCREDITATION)|CONSTRUCTION\s+INDUSTRY\s+AUTHORITY|\bCIAP\b|\bCONTRACTORS\b/',
+            'BIR 2303 (COR)' => '/(?=.*CERTIFICATE\s+OF\s+REGISTRATION)(?=.*(?:\b2303\b|INTERNAL\s+REVENUE|TAX\s+TYPES))/',
+            'BIR' => '/DIGITAL\s+TIN\s+ID|TIN\s+ID\s+ISSUE|TAXPAYER\s+IDENTIFICATION\s+NUMBER|(?=.*INTERNAL\s+REVENUE)(?=.*BIRTH\s*DATE)/',
+            'DTI CERTIFICATION' => '/DEPARTMENT\s+OF\s+TRADE\s+(?:AND|&)\s+INDUSTRY|BUSINESS\s+NAME\s+REGISTRATION|CERTIFICATE\s+OF\s+BUSINESS\s+NAME/',
+            'CDA CERTIFICATE' => '/COOPERATIVE\s+DEVELOPMENT\s+AUTHORITY/',
+            'BANK PASSBOOK' => '/(?=.*(?:PASSBOOK|SAVINGS\s+ACCOUNT))(?=.*BANK)/',
+        ];
+        // the title area: the first ~700 letters after the letterhead
+        foreach ([mb_substr($all, 0, 700), $all] as $t) {
+            foreach ($rules as $type => $re) if (preg_match($re, $t)) return $type;
+        }
+        return null;
+    }
+
+    /** the field rules that fit a detected type */
+    public function rulesFor(?string $detected, string $asked): string
+    {
+        return match ($detected) {
+            'BIR 2303 (COR)' => 'bir_2303',
+            'BIR' => 'valid_id',
+            'DTI CERTIFICATION' => 'dti',
+            'SEC CERTIFICATE' => 'sec',
+            'CDA CERTIFICATE' => 'cda',
+            'GIS FORM' => 'gis',
+            'PHILGEPS' => 'philgeps',
+            'TAX CLEARANCE' => 'tcc',
+            'AUTHORIZE TO PRINT (ATP)' => 'atp',
+            'PCAB' => 'pcab',
+            default => $asked,
+        };
+    }
+
     /** fields per document type */
     public function fields(string $type, string $text): array
     {
@@ -93,6 +140,7 @@ class DocumentReader
         switch ($type) {
             case 'dti':
                 $out['doc_no'] = $this->first($flat, ['/(?:Business\s*Name\s*(?:No\.?|Number)|Certificate\s*(?:No\.?|Number))\s*[:#]?\s*([A-Z0-9-]{5,})/i']);
+                $out['issued_at'] = $this->dayOf($flat);
                 $out['name_on_doc'] = $this->first($t, ['/(?:business\s*name|trade\s*name)\s*[:\n]\s*([^\n]{3,120})/i']);
                 // "… valid from June 1, 2024 to June 1, 2029"
                 $d = self::DATE;
@@ -137,13 +185,71 @@ class DocumentReader
                 $out['tax_types'] = $this->taxTypes($flat);
                 break;
 
+            case 'gis':   // SEC reg. no. · TIN · date of the meeting
+                $out['doc_no'] = $this->first($flat, ['/SEC\s*REGISTRATION\s*NUMBER\s*:?\s*([A-Z0-9-]{6,})/i', '/\b((?:CN|CS|PG|A|AS)\d{6,})\b/']);
+                $out['tin'] = preg_match('/\b(\d{3})[\s-](\d{3})[\s-](\d{3})\b/', $flat, $m) ? "{$m[1]}-{$m[2]}-{$m[3]}" : null;
+                $out['issued_at'] = $this->labelledDate($flat, ['date\s*of\s*actual\s*meeting', 'date\s*filed']);
+                $out['year'] = $this->first($flat, ['/FOR\s*THE\s*YEAR\s*(\d{4})/i']);
+                $out['name_on_doc'] = $this->first($t, ['/CORPORATE\s*NAME\s*:?\s*\n?\s*([^\n]{3,150})/i']);
+                break;
+
+            case 'philgeps':   // reference no. · registered on · issued · valid until
+                $out['doc_no'] = $this->first($flat, ['/Certificate\s*Reference\s*No\.?\s*[:#]?\s*(\d[\d\s-]{7,}\d)/i']);
+                if ($out['doc_no']) $out['doc_no'] = preg_replace('/\s+/', '', $out['doc_no']);
+                $out['date_registered'] = $this->labelledDate($flat, ['\(PhilGEPS\)\s*on', 'PhilGEPS\)?\s*on']);
+                $out['issued_at'] = $this->dayOf($flat);
+                $out['expires_at'] = $this->labelledDate($flat, ['valid\s*until', 'valid\s*up\s*to'], true);
+                break;
+
+            case 'tcc':   // BIR Tax Clearance Certificate
+                $out['doc_no'] = $this->first($flat, ['/TCC\s*NO\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9-]{5,})/i']);
+                $out['tin'] = preg_match('/\b(\d{3}-\d{3}-\d{3})(?:-\d{3,5})?\b/', $flat, $m) ? $m[1] : null;
+                $out['issued_at'] = $this->dayOf($flat) ?? $this->labelledDate($flat, ['date\s*issued', 'issued\s*on']);
+                $out['expires_at'] = $this->labelledDate($flat, ['expiration\s*date', 'valid\s*until']);
+                break;
+
+            case 'atp':   // BIR Authority to Print
+                $out['doc_no'] = $this->first($flat, ['/(?:ATP|Authority\s*to\s*Print)\s*(?:No\.?|Number)\s*[:#]?\s*([A-Z0-9][A-Z0-9-]{5,})/i', '/OCN\s*[:#]?\s*([0-9A-Z]{10,})/i']);
+                $out['issued_at'] = $this->labelledDate($flat, ['date\s*of\s*release(?:\s*of\s*authority\s*to\s*print)?', 'date\s*issued', 'date\s*of\s*issue']);
+                $out['expires_at'] = $this->labelledDate($flat, ['valid\s*until', 'expir(?:y|ation)\s*date']);
+                break;
+
+            case 'pcab':   // PCAB contractor's license: no. · first issue · validity period "… to …"
+                $out['doc_no'] = $this->first($flat, ['/Contractor[\'’]?s?\s*License\s*(?:Number|No\.?)\s*[:#]?\s*(\d{3,7})/i', '/License\s*(?:Number|No\.?)\s*[:#]?\s*(\d{3,7})/i']);
+                $d = self::DATE;
+                // table layout: "Contractor's License Number  February 06, 2023  46972" → skip the dates, take the number
+                if (!$out['doc_no'] && preg_match('/License\s*(?:Number|No\.?)(.{0,60})/i', $flat, $m)) {
+                    $rest = preg_replace("/{$d}/i", ' ', $m[1]);
+                    if (preg_match('/\b(\d{4,7})\b/', $rest, $n)) $out['doc_no'] = $n[1];
+                }
+                $out['date_registered'] = $this->labelledDate($flat, ['license\s*first\s*issue\s*date', 'first\s*issue\s*date']);
+                if (preg_match("/Validity\s*Period[^:]*:?\s*({$d})\s*(?:to|-)\s*({$d})/i", $flat, $m)) {
+                    $out['issued_at'] = $this->date($m[1]);
+                    $out['expires_at'] = $this->date($m[2]);
+                }
+                $out['issued_at'] ??= $this->dayOf($flat);
+                break;
+
             case 'wh_notice':
                 $out['doc_no'] = $this->first($flat, ['/(?:RR|RMC|RMO|Notice)\s*(?:No\.?)?\s*([0-9]{1,4}-[0-9]{2,4})/i']);
                 $out['issued_at'] = $this->firstDate($flat);
                 break;
 
             case 'valid_id': // any ID / permit: number, TIN, dates
-                $out['tin'] = preg_match('/\b(\d{3}-\d{3}-\d{3})(?:-\d{3,5})?\b/', $flat, $m) ? $m[1] : null;
+                // TIN: 234-885-678 · 234 885 678 · 234-885-678-000
+                $out['tin'] = preg_match('/\b(\d{3})[\s-](\d{3})[\s-](\d{3})(?:[\s-]\d{3,5})?\b/', $flat, $m) ? "{$m[1]}-{$m[2]}-{$m[3]}" : null;
+                // BIR TIN cards (yellow, green, digital): issue date · RDO · name
+                if (preg_match('/BUREAU\s+OF\s+INTERNAL\s+REVENUE|DIGITAL\s+TIN|TAXPAYER\s+IDENTIFICATION/i', $flat)) {
+                    $out['issued_at'] = $this->labelledDate($flat, ['tin\s*id\s*issue\s*date', 'tin\s*issuance\s*date', 'issue\s*date', 'date\s*issued'], true);
+                    $out['rdo'] = $this->first($flat, ['/RDO\s*(?:Code|No\.?)?\s*[:#]?\s*(\d{3})\b/i']);
+                    $out['doc_no'] = $this->first($flat, ['/\b(CN\s?\d{2}M\d{6,})\b/i']);   // digital TIN ID control number
+                    if (preg_match('/LAST\s*NAME\s*:?\s*([A-ZÑ .\'-]+?)\s+GIVEN\s*NAME\s*:?\s*([A-ZÑ .\'-]+?)\s+MIDDLE\s*NAME\s*:?\s*([A-ZÑ.\'-]+)/u', $flat, $n)) {
+                        $out['name_on_doc'] = trim("{$n[1]}, {$n[2]} {$n[3]}");
+                    } elseif (preg_match('/REVENUE\s+([A-ZÑ][A-ZÑ .\'-]+,\s*[A-ZÑ][A-ZÑ .\'-]+?)\s+TIN\b/u', $flat, $n)) {
+                        $out['name_on_doc'] = trim($n[1]);
+                    }
+                    break;
+                }
                 // no break: same rules as permits
             default: // permits: DENR, BOC, BOI, others
                 $out['doc_no'] = $this->first($flat, ['/(?:Permit|Certificate|Registration|Accreditation|Clearance)\s*(?:No\.?|Number)\s*[:#]?\s*([A-Z0-9-]{4,})/i']);
@@ -180,10 +286,12 @@ class DocumentReader
     }
 
     /** "Date of Registration: March 3, 2021" */
-    private function labelledDate(string $flat, array $labels): ?string
+    private function labelledDate(string $flat, array $labels, bool $dayFirst = false): ?string
     {
+        $date = self::DATE;
         foreach ($labels as $l) {
-            if (preg_match('/' . $l . '\s*[:\-]?\s*(.{6,30})/i', $flat, $m) && ($d = $this->date($m[1]))) return $d;
+            // "Issue date: 21-10-2023" · "TIN ID ISSUE DATE: DIGITAL TIN ID CONTROL NUMBER 19-JUL-2023"
+            if (preg_match('/' . $l . '\s*[:\-]?.{0,60}?(' . $date . ')/i', $flat, $m) && ($d = $this->date($m[1], $dayFirst))) return $d;
         }
         return null;
     }
@@ -204,17 +312,25 @@ class DocumentReader
     }
 
     /** any date text at the start of $s → Y-m-d */
-    public function date(?string $s): ?string
+    public function date(?string $s, bool $dayFirst = false): ?string
     {
         $s = trim((string) $s);
         if ($s === '') return null;
         if (preg_match('/^(\d{4})-(\d{2})-(\d{2})/', $s, $m)) return checkdate($m[2], $m[3], $m[1]) ? "{$m[1]}-{$m[2]}-{$m[3]}" : null;
-        if (preg_match('/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})/', $s, $m)) {                  // Philippine forms: MM/DD/YYYY
-            return checkdate((int) $m[1], (int) $m[2], (int) $m[3]) ? sprintf('%04d-%02d-%02d', $m[3], $m[1], $m[2]) : null;
+        if (preg_match('/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})/', $s, $m)) {
+            // Philippine forms: MM/DD/YYYY · TIN cards: DD-MM-YYYY · a first number above 12 can only be the day
+            [$a, $b, $y] = [(int) $m[1], (int) $m[2], (int) $m[3]];
+            [$mo, $d] = ($dayFirst || $a > 12) && $b <= 12 ? [$b, $a] : [$a, $b];
+            return checkdate($mo, $d, $y) ? sprintf('%04d-%02d-%02d', $y, $mo, $d) : null;
         }
-        if (preg_match('/^((?:' . self::MONTHS . ')\.?\s+\d{1,2},?\s+\d{4})/i', $s, $m)
+        // 14-SEP-2024 · 21 OCTOBER-2023 · 11-JULY 1996
+        if (preg_match('/^(\d{1,2})[\s-]+(' . self::MONTHS . ')\.?[\s,-]+(\d{4})/i', $s, $m)) {
+            $ts = strtotime(str_replace('Sept', 'Sep', "{$m[2]} {$m[1]}, {$m[3]}"));
+            return $ts ? date('Y-m-d', $ts) : null;
+        }
+        if (preg_match('/^((?:' . self::MONTHS . ')\.?\s+\d{1,2},?\s*\d{4})/i', $s, $m)
             || preg_match('/^(\d{1,2}\s+(?:' . self::MONTHS . ')\.?,?\s+\d{4})/i', $s, $m)) {
-            $ts = strtotime(str_replace(['.', 'Sept'], ['', 'Sep'], $m[1]));
+            $ts = strtotime(preg_replace('/,(\d)/', ', $1', str_replace(['.', 'Sept'], ['', 'Sep'], $m[1])));
             return $ts ? date('Y-m-d', $ts) : null;
         }
         return null;

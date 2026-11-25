@@ -49,6 +49,7 @@ use App\Http\Controllers\Api\PosController;
 use App\Http\Controllers\Api\EmployeePerformanceController;
 use App\Http\Controllers\Api\SalesOrderController;
 use App\Http\Controllers\Api\ClientTicketController;
+use App\Http\Controllers\Api\ClientDocumentController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -868,6 +869,14 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/client-tickets/{ticketNo}/attachment', [ClientTicketController::class, 'ticketAttachment']);
     Route::post('/client-tickets/{ticketNo}/approve', [ClientTicketController::class, 'ticketApprove']);
     Route::post('/client-tickets/{ticketNo}/decline', [ClientTicketController::class, 'ticketDecline']);
+
+    Route::get('/settings/documents', [ClientDocumentController::class, 'index']);
+    Route::post('/settings/documents/scan', [ClientDocumentController::class, 'scan']);
+    Route::post('/settings/documents', [ClientDocumentController::class, 'store']);
+    Route::put('/settings/documents/{id}', [ClientDocumentController::class, 'update'])->whereNumber('id');
+    Route::delete('/settings/documents/{id}', [ClientDocumentController::class, 'destroy'])->whereNumber('id');
+    Route::get('/settings/documents/{id}/file', [ClientDocumentController::class, 'file'])->whereNumber('id');
+    Route::put('/settings/profile-extra', [ClientDocumentController::class, 'profileExtra']);
 
     require __DIR__ . '/api_messenger.php';
 });

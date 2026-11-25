@@ -109,6 +109,8 @@ class DocumentReader
         foreach ([mb_substr($all, 0, 700), $all] as $t) {
             foreach ($rules as $type => $re) if (preg_match($re, $t)) return $type;
         }
+        // TIN card with a blurred title: "...REVENUE" plus a TIN number
+        if (preg_match('/REVENUE/', $all) && preg_match('/\b\d{3}-\d{3}-\d{3}(?:-\d{3,5})?\b/', $all)) return 'BIR';
         return null;
     }
 
@@ -239,8 +241,25 @@ class DocumentReader
                 // TIN: 234-885-678 · 234 885 678 · 234-885-678-000
                 $out['tin'] = preg_match('/\b(\d{3})[\s-](\d{3})[\s-](\d{3})(?:[\s-]\d{3,5})?\b/', $flat, $m) ? "{$m[1]}-{$m[2]}-{$m[3]}" : null;
                 // BIR TIN cards (yellow, green, digital): issue date · RDO · name
-                if (preg_match('/BUREAU\s+OF\s+INTERNAL\s+REVENUE|DIGITAL\s+TIN|TAXPAYER\s+IDENTIFICATION/i', $flat)) {
-                    $out['issued_at'] = $this->labelledDate($flat, ['tin\s*id\s*issue\s*date', 'tin\s*issuance\s*date', 'issue\s*date', 'date\s*of\s*issue', 'date\s*issued'], true);
+                if (preg_match('/BUREAU\s+OF\s+INTERNAL\s+REVENUE|DIGITAL\s+TIN|TAXPAYER\s+IDENTIFICATION/i', $flat)
+                    || ($out['tin'] && preg_match('/REVENUE/i', $flat))) {
+                    $d = self::DATE;
+                    // labels side by side with the dates under them: "BIRTH DATE  ISSUE DATE  03/08/1980  1/27/1998"
+                    if (preg_match("/BIRTH\\s*DATE\\s+ISSUE\\s*DATE\\s*:?\\s*({$d})\\s+({$d})/i", $flat, $m)) {
+                        $out['issued_at'] = $this->date($m[2], true);
+                    } elseif (preg_match("/ISSUE\\s*DATE\\s+BIRTH\\s*DATE\\s*:?\\s*({$d})\\s+({$d})/i", $flat, $m)) {
+                        $out['issued_at'] = $this->date($m[1], true);
+                    } else {
+                        $out['issued_at'] = $this->labelledDate($flat, ['tin\s*id\s*issue\s*date', 'tin\s*issuance\s*date', 'issue\s*date', 'date\s*of\s*issue', 'date\s*issued'], true);
+                    }
+                    // never the birth date
+                    $birth = $this->labelledDate($flat, ['birth\s*date', 'date\s*of\s*birth', 'birthdate'], true);
+                    if ($out['issued_at'] && $birth && $out['issued_at'] === $birth) $out['issued_at'] = null;
+                    // labels lost in the scan: the latest date on the card that isn't the birth date
+                    if (!$out['issued_at'] && preg_match_all("/{$d}/i", $flat, $mm)) {
+                        $dates = array_filter(array_map(fn ($x) => $this->date($x, true), $mm[0]), fn ($x) => $x && $x !== $birth);
+                        if ($dates) $out['issued_at'] = max($dates);
+                    }
                     $out['rdo'] = $this->first($flat, ['/RDO\s*(?:Code|No\.?)?\s*[:#]?\s*(\d{3})\b/i']);
                     $out['doc_no'] = $this->first($flat, ['/\b(CN\s?\d{2}M\d{6,})\b/i']);   // digital TIN ID control number
                     if (preg_match('/LAST\s*NAME\s*:?\s*([A-ZÑ .\'-]+?)\s+GIVEN\s*NAME\s*:?\s*([A-ZÑ .\'-]+?)\s+MIDDLE\s*NAME\s*:?\s*([A-ZÑ.\'-]+)/u', $flat, $n)) {

@@ -100,7 +100,7 @@ class DocumentReader
             'PHILGEPS' => '/PHILGEPS|ELECTRONIC\s+PROCUREMENT/',
             'PCAB' => '/\bPCAB\b|CONTRACTORS?[\'’]?\s*(?:LICENSE|ACCREDITATION)|CONSTRUCTION\s+INDUSTRY\s+AUTHORITY|\bCIAP\b|\bCONTRACTORS\b/',
             'BIR 2303 (COR)' => '/(?=.*CERTIFICATE\s+OF\s+REGISTRATION)(?=.*(?:\b2303\b|INTERNAL\s+REVENUE|TAX\s+TYPES))/',
-            'BIR' => '/DIGITAL\s+TIN\s+ID|TIN\s+ID\s+ISSUE|TAXPAYER\s+IDENTIFICATION\s+NUMBER|(?=.*INTERNAL\s+REVENUE)(?=.*BIRTH\s*DATE)/',
+            'BIR' => '/DIGITAL\s+TIN\s+ID|TIN\s+ID\s+ISSUE|TAXPAYER\s+IDENTIFICATION\s+NUMBER|(?=.*INTERNAL\s+REVENUE)(?=.*(?:BIRTH\s*DATE|DATE\s+OF\s+BIRTH))/',
             'DTI CERTIFICATION' => '/DEPARTMENT\s+OF\s+TRADE\s+(?:AND|&)\s+INDUSTRY|BUSINESS\s+NAME\s+REGISTRATION|CERTIFICATE\s+OF\s+BUSINESS\s+NAME/',
             'CDA CERTIFICATE' => '/COOPERATIVE\s+DEVELOPMENT\s+AUTHORITY/',
             'BANK PASSBOOK' => '/(?=.*(?:PASSBOOK|SAVINGS\s+ACCOUNT))(?=.*BANK)/',
@@ -240,7 +240,7 @@ class DocumentReader
                 $out['tin'] = preg_match('/\b(\d{3})[\s-](\d{3})[\s-](\d{3})(?:[\s-]\d{3,5})?\b/', $flat, $m) ? "{$m[1]}-{$m[2]}-{$m[3]}" : null;
                 // BIR TIN cards (yellow, green, digital): issue date · RDO · name
                 if (preg_match('/BUREAU\s+OF\s+INTERNAL\s+REVENUE|DIGITAL\s+TIN|TAXPAYER\s+IDENTIFICATION/i', $flat)) {
-                    $out['issued_at'] = $this->labelledDate($flat, ['tin\s*id\s*issue\s*date', 'tin\s*issuance\s*date', 'issue\s*date', 'date\s*issued'], true);
+                    $out['issued_at'] = $this->labelledDate($flat, ['tin\s*id\s*issue\s*date', 'tin\s*issuance\s*date', 'issue\s*date', 'date\s*of\s*issue', 'date\s*issued'], true);
                     $out['rdo'] = $this->first($flat, ['/RDO\s*(?:Code|No\.?)?\s*[:#]?\s*(\d{3})\b/i']);
                     $out['doc_no'] = $this->first($flat, ['/\b(CN\s?\d{2}M\d{6,})\b/i']);   // digital TIN ID control number
                     if (preg_match('/LAST\s*NAME\s*:?\s*([A-ZÑ .\'-]+?)\s+GIVEN\s*NAME\s*:?\s*([A-ZÑ .\'-]+?)\s+MIDDLE\s*NAME\s*:?\s*([A-ZÑ.\'-]+)/u', $flat, $n)) {
@@ -320,7 +320,8 @@ class DocumentReader
         if (preg_match('/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})/', $s, $m)) {
             // Philippine forms: MM/DD/YYYY · TIN cards: DD-MM-YYYY · a first number above 12 can only be the day
             [$a, $b, $y] = [(int) $m[1], (int) $m[2], (int) $m[3]];
-            [$mo, $d] = ($dayFirst || $a > 12) && $b <= 12 ? [$b, $a] : [$a, $b];
+            $dash = str_contains(substr($s, 0, 10), '-');
+            [$mo, $d] = (($dayFirst && $dash) || $a > 12) && $b <= 12 ? [$b, $a] : [$a, $b];
             return checkdate($mo, $d, $y) ? sprintf('%04d-%02d-%02d', $y, $mo, $d) : null;
         }
         // 14-SEP-2024 · 21 OCTOBER-2023 · 11-JULY 1996

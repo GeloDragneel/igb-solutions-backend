@@ -50,6 +50,8 @@ use App\Http\Controllers\Api\EmployeePerformanceController;
 use App\Http\Controllers\Api\SalesOrderController;
 use App\Http\Controllers\Api\ClientTicketController;
 use App\Http\Controllers\Api\ClientDocumentController;
+use App\Http\Controllers\Api\InventorySettingsController;
+use App\Http\Controllers\Api\AiAgentController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
@@ -879,6 +881,12 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::put('/settings/profile-extra', [ClientDocumentController::class, 'profileExtra']);
     Route::post('/settings/documents/fields', [ClientDocumentController::class, 'fieldsFromText']);
     
+    Route::get('/inventory/settings', [InventorySettingsController::class, 'showInvSettings']);
+    Route::put('/inventory/settings', [InventorySettingsController::class, 'updateInvSettings']);
+
+    Route::get('/ai/agents/analyst', [AiAgentController::class, 'analyst']);
+    Route::get('/ai/agents/auditor', [AiAgentController::class, 'auditor']);
+
     require __DIR__ . '/api_messenger.php';
 });
 

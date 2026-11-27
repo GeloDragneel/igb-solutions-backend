@@ -17,8 +17,6 @@ use App\Models\GRNMaster;
 use App\Models\GRNDetail;
 use App\Models\GeneralJournal;
 use App\Models\Items;
-use App\Models\PurchaseOrderMaster;
-use App\Models\PurchaseOrderDetail;
 use App\Models\WtbManual;
 use App\Models\BegBalanceAccount;
 use App\Models\BegBalanceProduct;
@@ -31,6 +29,7 @@ use PhpOffice\PhpSpreadsheet\Style\Fill;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use Illuminate\Support\Str;
 use Illuminate\Http\Request;
+use App\Services\InventoryCosting;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Cache;
@@ -215,7 +214,13 @@ class ReportController extends SalesController
             ->where('invoice_status_id', '<>', 5)
             ->where('trans_type', 'posted')
             ->where(fn($q) => $byDate($q, 'transaction_date'))
-            ->get(['id', 'added_by', 'invoice_no', 'document_no', 'customer_id', 'account_code', 'transaction_date', 'declared_month', 'created_at', 'input_vat', 'net_of_vat', 'vat_exempt', 'non_vat', 'zero_rated', 'ex_rate']);
+            ->get(['id', 'added_by', 'invoice_no', 'document_no', 'customer_id', 'account_code', 'transaction_date', 'declared_month', 'created_at', 'input_vat', 'net_of_vat', 'vat_exempt', 'non_vat', 'zero_rated', 'ex_rate', 'item_id']);
+
+        // Cost of Sales of Stock Items (m_item_class 1): cost by the Inventory Method, accounts from the item
+        $stockItems = DB::table('m_items')->whereIn('id', $lines->pluck('item_id')->filter()->unique()->values()->all() ?: [0])
+            ->where('item_class_id', 1)
+            ->get(['id', 'gl_inventory_account', 'gl_cost_of_sales_account'])->keyBy('id');
+        $lineCost = $stockItems->isNotEmpty() ? InventoryCosting::costs($ids, $account->id ?? null) : [];
 
         $rvs = RVoucherMaster::whereIn('added_by', $ids)
             ->where('sub_total', '>', 0)
@@ -244,8 +249,8 @@ class ReportController extends SalesController
 
         $rows = [];
 
-        $push = function(int $rank, $src, string $date, $code, string $desc, float $dr, float $cr, ?string $docNo = null) use (&$rows, $cust) {
-            $rows[] = [
+        $push = function(int $rank, $src, string $date, $code, string $desc, float $dr, float $cr, ?string $docNo = null, ?string $section = null) use (&$rows, $cust) {
+            $rows[] = ($section ? ['section' => $section] : []) + [
                 'date' => $date,
                 'invoice_no' => (string) $src->invoice_no,
                 'account_id' => (string) $code,
@@ -272,6 +277,16 @@ class ReportController extends SalesController
             $total = ((float) $l->net_of_vat + (float) $l->vat_exempt + (float) $l->non_vat + (float) $l->zero_rated) * $rate;
             if ((float) $l->input_vat != 0) $push(2, $l, $date, $l->account_code, 'Output VAT', 0, (float) $l->input_vat * $rate);
             if ($total != 0) $push(2, $l, $date, $l->account_code, $acct($l->added_by, $l->account_code), 0, $total);
+
+            // Inventory / Cost of Sales (Stock Item with both accounts): Dr cost of sales · Cr inventory
+            $it = $stockItems[$l->item_id] ?? null;
+            $inv = trim((string) ($it->gl_inventory_account ?? ''));
+            $cos = trim((string) ($it->gl_cost_of_sales_account ?? ''));
+            $cost = (float) ($lineCost[(int) $l->id] ?? 0);
+            if ($it && $inv !== '' && $inv !== '0' && $cos !== '' && $cos !== '0' && $cost != 0) {
+                $push(2, $l, $date, $cos, $acct($l->added_by, $cos) ?: 'Cost of Sales', $cost, 0, null, 'cost');
+                $push(2, $l, $date, $inv, $acct($l->added_by, $inv) ?: 'Inventory', 0, $cost, null, 'cost');
+            }
         }
 
         foreach ($rvs as $r) {
@@ -292,6 +307,9 @@ class ReportController extends SalesController
             return $r;
         }, $rows);
 
+        // totals = sales journal only (inventory / cost of sales lines are shown, not added)
+        $counted = array_filter($rows, fn ($r) => ($r['section'] ?? '') !== 'cost');
+
         return response()->json([
             'company' => $this->companyHeader($account),
             'branches' => $branches->map(fn($b) => [
@@ -300,8 +318,8 @@ class ReportController extends SalesController
             ])->values(),
             'rows' => $rows,
             'totals' => [
-                'debit' => round(array_sum(array_column($rows, 'debit')), 4),
-                'credit' => round(array_sum(array_column($rows, 'credit')), 4),
+                'debit' => round(array_sum(array_column($counted, 'debit')), 4),
+                'credit' => round(array_sum(array_column($counted, 'credit')), 4),
             ],
         ]);
     }
@@ -3085,6 +3103,8 @@ class ReportController extends SalesController
         ]);
     }
     /* ======================= Income Tax Summary (old Income_Statement.php) ======================= */
+    // m_item_class 1 = Stock Item (only these get a cost of sales)
+    private const ITS_STOCK_ITEM_CLASS = 1;
     // TRAIN law, used only if m_tax_brackets is missing
     private const ITS_BRACKETS = [
         ['min' => 0,       'max' => 250000,  'base' => 0,       'rate' => 0],
@@ -3187,7 +3207,7 @@ class ReportController extends SalesController
             ->whereIn('m.added_by', $ids)->where('m.invoice_status_id', '<>', 5)->where('m.record_status', 'posted')->where('x.record_status', 'posted')
             ->whereBetween('m.declared_month', [$from, $to]);
 
-        $sales = $purchases = $expenses = [];
+        $sales = $purchases = $expenses = $cogs = [];
         if ($ids) {
             // SALES – 4xxxx
             $sales = $this->itsGroup(
@@ -3197,21 +3217,35 @@ class ReportController extends SalesController
                 'x.account_code', 'x.declared_month', $amt('x') . ' * COALESCE(NULLIF(x.ex_rate,0),1)', 'x.invoice_no'
             );
 
-            // PURCHASES – 5xxxx (GRN + AP)
-            $purchases = $this->itsMerge(
-                $this->itsGroup(
-                    DB::table('t_grn_detail as x')
-                        ->whereIn('x.receive_by', $ids)->where('x.grn_status_id', '<>', 5)
-                        ->whereBetween('x.declared_month', [$from, $to])
-                        ->where('x.account_code', 'like', '5%')->where('x.total', '<>', 0),
-                    'x.account_code', 'x.declared_month', $amt('x'), 'x.grn_no'
-                ),
-                $this->itsGroup($ap()->where('x.account_code', 'like', '5%'), 'x.account_code', 'm.declared_month', $amt('x'), 'm.invoice_no')
-            );
+            // COST OF SALES
+            //  1) AP lines of trans_type = Purchases (every account)
+            //  2) cost of Stock Items sold (m_item_class 1), by the Inventory Method (FIFO / WAC / Specific),
+            //     on the item's cost of sales account (same entry as the Sales journal: Dr cost of sales / Cr inventory)
+            $costs = InventoryCosting::costs($ids, $account->id ?? null);
+            $soldLines = DB::table('t_sales_invoice_detail as x')
+                ->join('m_items as I', 'I.id', '=', 'x.item_id')
+                ->whereIn('x.added_by', $ids)->where('x.invoice_status_id', '<>', 5)->where('x.trans_type', 'posted')
+                ->whereBetween('x.declared_month', [$from, $to])
+                ->where('I.item_class_id', self::ITS_STOCK_ITEM_CLASS)
+                ->whereNotNull('I.gl_cost_of_sales_account')->whereNotIn('I.gl_cost_of_sales_account', ['', '0'])
+                ->whereNotNull('I.gl_inventory_account')->whereNotIn('I.gl_inventory_account', ['', '0'])
+                ->get(['x.id', 'x.invoice_no', 'x.declared_month', 'I.gl_cost_of_sales_account as code']);
+            foreach ($soldLines as $l) {
+                $v = (float) ($costs[(int) $l->id] ?? 0);
+                if ($v == 0) continue;
+                $c = (string) $l->code;
+                $cogs[$c]['values'][$l->declared_month] = ($cogs[$c]['values'][$l->declared_month] ?? 0) + $v;
+                $cogs[$c]['refs'][$l->declared_month][] = (string) $l->invoice_no;
+                $cogs[$c]['extra'] = 0;
+            }
+            // purchases and cost of sales are kept apart: Ending = Beginning + Purchases − Cost of Sales
+            $purchases = $this->itsGroup($ap()->whereRaw('LOWER(m.trans_type) = ?', ['purchases']), 'x.account_code', 'm.declared_month', $amt('x'), 'm.invoice_no');
 
-            // EXPENSES – 6xxxx and 8xxxx (with Non-VAT total)
+            // EXPENSES – 6xxxx and 8xxxx of trans_type = Expenses (with Non-VAT total)
+            // (Purchases lines are all in Cost of Sales now, so they are not counted twice)
             $expenses = $this->itsGroup(
-                $ap()->where(fn ($q) => $q->where('x.account_code', 'like', '6%')->orWhere('x.account_code', 'like', '8%')),
+                $ap()->whereRaw('LOWER(m.trans_type) = ?', ['expenses'])
+                    ->where(fn ($q) => $q->where('x.account_code', 'like', '6%')->orWhere('x.account_code', 'like', '8%')),
                 'x.account_code', 'm.declared_month', $amt('x'), 'm.invoice_no', 'COALESCE(x.non_vat,0)'
             );
 
@@ -3243,12 +3277,17 @@ class ReportController extends SalesController
                     'adjustment' => 0, 'nonvat' => round($g['extra'] ?? 0, 2),
                 ];
             }
+            // by account name A → Z (then by code); "-", "–" and "—" count as the same dash
+            $key = fn ($t) => preg_replace('/\s+/', ' ', str_replace(['–', '—'], '-', trim((string) $t)));
+            usort($rows, fn ($x, $y) => strnatcasecmp($key($x['label']), $key($y['label'])) ?: strcmp($x['code'], $y['code']));
             return $rows;
         };
 
-        // Beginning inventory (product beginning balances)
-        $beginning = $ids ? (float) DB::table('t_beg_balance_product')
-            ->whereIn('added_by', $ids)->whereBetween('declared_month', [$from, $to])->sum('total_cost') : 0;
+        // Merchandise Inventory, Beginning / Ending: value of the Stock Items on hand, by the Inventory Method
+        //   beginning = everything before the first month (+ that month's beginning balance) · ending = through the last month
+        $caid = $account->id ?? null;
+        $beginning = $ids ? InventoryCosting::value($ids, $caid, "{$from}-00") : 0;
+        $ending    = $ids ? InventoryCosting::value($ids, $caid, "{$to}-31") : 0;
 
         // Creditable withholding 2307 (IT) on sales this period
         $ewt2307 = $ids ? (float) SalesInvoiceMaster::whereIn('added_by', $ids)->where('invoice_status_id', '<>', 5)->where('trans_type', 'posted')
@@ -3269,8 +3308,10 @@ class ReportController extends SalesController
             'months'    => $months,
             'sales'     => $toRows($sales, 'SALES'),
             'purchases' => $toRows($purchases, 'COGS'),
+            'costs'     => $toRows($cogs, 'COGS'),          // cost of Stock Items sold (Inventory Method)
             'expenses'  => $toRows($expenses, 'EXP'),
             'beginning' => round($beginning, 2),
+            'ending'    => round($ending, 2),
             'ewt2307'   => round($ewt2307, 2),
             'brackets'  => $brackets,
             'corporate' => $this->itsCorporate($account),
@@ -3301,6 +3342,10 @@ class ReportController extends SalesController
             if ($d['type'] === 'COGS') {
                 $rows = $rows->concat(DB::table('t_grn_master')->whereIn('grn_no', $refs)->whereIn('receive_by', $ids)
                     ->selectRaw("NULL AS sales_id, vendor_id AS pid, grn_no AS ref, ref_data AS doc, grn_date AS date, declared_month AS dm, grand_total AS total, 'Receive Inventory' AS module")
+                    ->get());
+                // sales invoices behind the cost of Stock Items sold
+                $rows = $rows->concat(DB::table('t_sales_invoice_master')->whereIn('invoice_no', $refs)->whereIn('added_by', $ids)
+                    ->selectRaw("id AS sales_id, customer_id AS pid, invoice_no AS ref, document_no AS doc, transaction_date AS date, declared_month AS dm, grand_total AS total, 'Sales / Invoice (cost of sales)' AS module")
                     ->get());
             }
         }

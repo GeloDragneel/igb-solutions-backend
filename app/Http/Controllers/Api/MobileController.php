@@ -2075,7 +2075,6 @@ class MobileController extends Controller
      * ========================================================= */
 
     /** POST login {username, password, loginAttempt} */
-    /** POST login {username, password, loginAttempt} */
     public function login(Request $r)
     {
         $username = trim((string) $r->input('username', ''));

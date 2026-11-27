@@ -22,7 +22,7 @@ use Illuminate\Support\Str;
  *   DELETE /settings/documents/{id}
  *   GET    /settings/documents/{id}/file       { url } (link valid 10 minutes)
  *   PUT    /settings/profile-extra             { date_of_operation, is_withholding_agent, msme_class }
- */
+*/
 class ClientDocumentController extends SalesController
 {
     const FOLDER = 'ID_Solutions';
@@ -207,7 +207,6 @@ class ClientDocumentController extends SalesController
         ]);
         return response()->json(['message' => 'Document saved.', 'documents' => $this->documents($num)], 201);
     }
-
     /* PUT /settings/documents/{id} */
     public function update(Request $request, int $id)
     {
